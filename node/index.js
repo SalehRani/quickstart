@@ -43,10 +43,14 @@ const PLAID_REDIRECT_URI = process.env.PLAID_REDIRECT_URI || '';
 // e.g. com.plaid.linksample
 const PLAID_ANDROID_PACKAGE_NAME = process.env.PLAID_ANDROID_PACKAGE_NAME || '';
 
+// Parameter used for Signal ruleset key
+const SIGNAL_RULESET_KEY = process.env.SIGNAL_RULESET_KEY || '';
+
 // We store the access_token in memory - in production, store it in a secure
 // persistent data store
 let ACCESS_TOKEN = null;
 let USER_TOKEN = null;
+let USER_ID = null;
 let PUBLIC_TOKEN = null;
 let ITEM_ID = null;
 let ACCOUNT_ID = null;
@@ -125,7 +129,15 @@ app.post('/api/create_link_token', function (request, response, next) {
       }
 
       if (PLAID_PRODUCTS.some(product => product.startsWith("cra_"))) {
-        configs.user_token = USER_TOKEN;
+        // Use user_token if available, otherwise use user_id
+        if (USER_TOKEN) {
+          configs.user_token = USER_TOKEN;
+          // Keep user object when using user_token
+        } else if (USER_ID) {
+          configs.user_id = USER_ID;
+          // Remove user object when using user_id
+          delete configs.user;
+        }
         configs.cra_options = {
           days_requested: 60
         };
@@ -144,30 +156,85 @@ app.post('/api/create_user_token', function (request, response, next) {
   Promise.resolve()
     .then(async function () {
 
-      const request = {
-        // Typically this will be a user ID number from your application. 
+      const userRequest = {
+        // Typically this will be a user ID number from your application.
         client_user_id: 'user_' + uuidv4()
       }
 
       if (PLAID_PRODUCTS.some(product => product.startsWith("cra_"))) {
-        request.consumer_report_user_identity = {
+        // Default to sending identity object
+        userRequest.identity = {
+          name: {
+            given_name: 'Harry',
+            family_name: 'Potter'
+          },
           date_of_birth: '1980-07-31',
-          first_name: 'Harry',
-          last_name: 'Potter',
-          phone_numbers: ['+16174567890'],
-          emails: ['harrypotter@example.com'],
-          primary_address: {
+          phone_numbers: [{
+            data: '+16174567890',
+            primary: true
+          }],
+          emails: [{
+            data: 'harrypotter@example.com',
+            primary: true
+          }],
+          addresses: [{
+            street_1: '4 Privet Drive',
             city: 'New York',
             region: 'NY',
-            street: '4 Privet Drive',
             postal_code: '11111',
-            country: 'US'
-          }
+            country: 'US',
+            primary: true
+          }]
         }
       }
-      const user = await client.userCreate(request);
-      USER_TOKEN = user.data.user_token
-      response.json(user.data);
+
+      try {
+        const user = await client.userCreate(userRequest);
+
+        if (user.data.user_token) {
+          USER_TOKEN = user.data.user_token;
+        }
+        if (user.data.user_id) {
+          USER_ID = user.data.user_id;
+        }
+
+        response.json(user.data);
+      } catch (error) {
+        if (error.response && error.response.data &&
+            error.response.data.error_code === 'INVALID_FIELD' &&
+            PLAID_PRODUCTS.some(product => product.startsWith("cra_"))) {
+
+          // Retry with consumer_report_user_identity
+          delete userRequest.identity;
+          userRequest.consumer_report_user_identity = {
+            date_of_birth: '1980-07-31',
+            first_name: 'Harry',
+            last_name: 'Potter',
+            phone_numbers: ['+16174567890'],
+            emails: ['harrypotter@example.com'],
+            primary_address: {
+              city: 'New York',
+              region: 'NY',
+              street: '4 Privet Drive',
+              postal_code: '11111',
+              country: 'US'
+            }
+          }
+
+          const retryUser = await client.userCreate(userRequest);
+
+          if (retryUser.data.user_token) {
+            USER_TOKEN = retryUser.data.user_token;
+          }
+          if (retryUser.data.user_id) {
+            USER_ID = retryUser.data.user_id;
+          }
+
+          response.json(retryUser.data);
+        } else {
+          throw error;
+        }
+      }
     }).catch(next);
 });
 
@@ -374,7 +441,7 @@ app.get('/api/balance', function (request, response, next) {
         access_token: ACCESS_TOKEN,
       });
       prettyPrintResponse(balanceResponse);
-      response.json(balanceResponse.data);
+      response.json({ accounts: balanceResponse.data.accounts });
     })
     .catch(next);
 });
@@ -651,12 +718,21 @@ app.get('/api/signal_evaluate', function (request, response, next) {
       });
       ACCOUNT_ID = accountsResponse.data.accounts[0].account_id;
 
-      const signalEvaluateResponse = await client.signalEvaluate({
+      // Generate unique transaction ID using timestamp and random component
+      const clientTransactionId = `txn-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+
+      const signalEvaluateRequest = {
         access_token: ACCESS_TOKEN,
         account_id: ACCOUNT_ID,
-        client_transaction_id: 'txn1234',
+        client_transaction_id: clientTransactionId,
         amount: 100.00,
-      });
+      };
+
+      if (SIGNAL_RULESET_KEY) {
+        signalEvaluateRequest.ruleset_key = SIGNAL_RULESET_KEY;
+      }
+
+      const signalEvaluateResponse = await client.signalEvaluate(signalEvaluateRequest);
       prettyPrintResponse(signalEvaluateResponse);
       response.json(signalEvaluateResponse.data);
     })
@@ -669,12 +745,17 @@ app.get('/api/signal_evaluate', function (request, response, next) {
 app.get('/api/cra/get_base_report', function (request, response, next) {
   Promise.resolve()
     .then(async function () {
-      const getResponse = await getCraBaseReportWithRetries(client, USER_TOKEN);
+      // Use user_token if available, otherwise use user_id
+      const userIdentifier = USER_TOKEN || USER_ID;
+      const identifierKey = USER_TOKEN ? 'user_token' : 'user_id';
+
+      const getResponse = await getCraBaseReportWithRetries(client, userIdentifier, identifierKey);
       prettyPrintResponse(getResponse);
 
-      const pdfResponse = await client.craCheckReportPdfGet({
-        user_token: USER_TOKEN,
-      }, {
+      const pdfRequest = {};
+      pdfRequest[identifierKey] = userIdentifier;
+
+      const pdfResponse = await client.craCheckReportPdfGet(pdfRequest, {
         responseType: 'arraybuffer'
       });
 
@@ -688,16 +769,18 @@ app.get('/api/cra/get_base_report', function (request, response, next) {
 
 const getCraBaseReportWithRetries = (
   plaidClient,
-  userToken
-) => pollWithRetries(
-  async () => {
-    return await plaidClient.craCheckReportBaseReportGet(
-      {
-        user_token: userToken
-      }
-    )
-  }
-);
+  userIdentifier,
+  identifierKey = 'user_token'
+) => {
+  const requestBody = {};
+  requestBody[identifierKey] = userIdentifier;
+
+  return pollWithRetries(
+    async () => {
+      return await plaidClient.craCheckReportBaseReportGet(requestBody)
+    }
+  );
+};
 
 // Retrieve CRA Income Insights and PDF with Insights
 // Income insights: https://plaid.com/docs/check/api/#cracheck_reportincome_insightsget
@@ -705,13 +788,18 @@ const getCraBaseReportWithRetries = (
 app.get('/api/cra/get_income_insights', async (req, res, next) => {
   Promise.resolve()
     .then(async function () {
-      const getResponse = await getCheckInsightsWithRetries(client, USER_TOKEN)
+      // Use user_token if available, otherwise use user_id
+      const userIdentifier = USER_TOKEN || USER_ID;
+      const identifierKey = USER_TOKEN ? 'user_token' : 'user_id';
+
+      const getResponse = await getCheckInsightsWithRetries(client, userIdentifier, identifierKey)
       prettyPrintResponse(getResponse);
 
-      const pdfResponse = await client.craCheckReportPdfGet({
-        user_token: USER_TOKEN,
-        add_ons: ['cra_income_insights']
-      }, {
+      const pdfRequest = {};
+      pdfRequest[identifierKey] = userIdentifier;
+      pdfRequest.add_ons = ['cra_income_insights'];
+
+      const pdfResponse = await client.craCheckReportPdfGet(pdfRequest, {
         responseType: 'arraybuffer'
       });
 
@@ -726,14 +814,13 @@ app.get('/api/cra/get_income_insights', async (req, res, next) => {
 
 const getCheckInsightsWithRetries = (
   plaidClient,
-  userToken
+  userIdentifier,
+  identifierKey
 ) => pollWithRetries(
   async () => {
-    return await plaidClient.craCheckReportIncomeInsightsGet(
-      {
-        user_token: userToken
-      }
-    );
+    const request = {};
+    request[identifierKey] = userIdentifier;
+    return await plaidClient.craCheckReportIncomeInsightsGet(request);
   }
 );
 
@@ -742,7 +829,11 @@ const getCheckInsightsWithRetries = (
 app.get('/api/cra/get_partner_insights', async (req, res, next) => {
   Promise.resolve()
     .then(async function () {
-      const response = await getCheckParnterInsightsWithRetries(client, USER_TOKEN);
+      // Use user_token if available, otherwise use user_id
+      const userIdentifier = USER_TOKEN || USER_ID;
+      const identifierKey = USER_TOKEN ? 'user_token' : 'user_id';
+
+      const response = await getCheckParnterInsightsWithRetries(client, userIdentifier, identifierKey);
       prettyPrintResponse(response);
 
       res.json(response.data);
@@ -753,16 +844,18 @@ app.get('/api/cra/get_partner_insights', async (req, res, next) => {
 
 const getCheckParnterInsightsWithRetries = (
   plaidClient,
-  userToken
-) => pollWithRetries(
-  async () => {
-    return await plaidClient.craCheckReportPartnerInsightsGet(
-      {
-        user_token: userToken
-      }
-    );
-  }
-);
+  userIdentifier,
+  identifierKey = 'user_token'
+) => {
+  const requestBody = {};
+  requestBody[identifierKey] = userIdentifier;
+
+  return pollWithRetries(
+    async () => {
+      return await plaidClient.craCheckReportPartnerInsightsGet(requestBody);
+    }
+  );
+};
 
 // Since this quickstart does not support webhooks, this function can be used to poll
 // an API that would otherwise be triggered by a webhook.
